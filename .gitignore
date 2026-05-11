@@ -1,0 +1,15 @@
+build*/
+*.run/
+.tmp/
+.venv/
+__pycache__/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.cache
+*.log
+version.txt
+config/
+shared_km/*.exe
+.claude/
