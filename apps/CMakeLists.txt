@@ -28,8 +28,11 @@ target_link_libraries(shared_km_edge_switch_probe
 )
 
 # Read and format version from version.txt
-file(READ "${PROJECT_SOURCE_DIR}/version.txt" SHARED_KM_BUILD_NUM)
-string(STRIP "${SHARED_KM_BUILD_NUM}" SHARED_KM_BUILD_NUM)
+set(SHARED_KM_BUILD_NUM "0")
+if(EXISTS "${PROJECT_SOURCE_DIR}/version.txt")
+    file(READ "${PROJECT_SOURCE_DIR}/version.txt" SHARED_KM_BUILD_NUM)
+    string(STRIP "${SHARED_KM_BUILD_NUM}" SHARED_KM_BUILD_NUM)
+endif()
 if(SHARED_KM_BUILD_NUM MATCHES "^[0-9]+$")
     math(EXPR SHARED_KM_BUILD_NUM "${SHARED_KM_BUILD_NUM}")
     if(SHARED_KM_BUILD_NUM LESS 10)
