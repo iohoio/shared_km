@@ -100,6 +100,11 @@ void RefreshFileTransferList();
 std::string g_current_receiver_host;
 int g_current_receiver_port = 0;
 
+// HTTP download server (port 8888)
+std::atomic<bool> g_http_server_running{false};
+std::thread g_http_server_thread;
+void RunHttpServer(std::atomic<bool>& running);
+
 // -- In-process service state --
 std::atomic<bool> g_receiver_active{false};
 std::atomic<bool> g_sender_active{false};
@@ -150,6 +155,92 @@ std::wstring FormatFileSize(std::uint64_t bytes) {
         std::swprintf(buf, 32, L"%.1f %s", size, units[unit]);
     }
     return buf;
+}
+
+void RunHttpServer(std::atomic<bool>& running) {
+    const auto sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) return;
+    constexpr BOOL reuse = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(8888);
+    if (bind(sock, reinterpret_cast<SOCKADDR*>(&addr), sizeof(addr)) != 0 || listen(sock, SOMAXCONN) != 0) {
+        closesocket(sock);
+        return;
+    }
+    u_long nonblock = 1;
+    ioctlsocket(sock, FIONBIO, &nonblock);
+    std::string file_dir = WStringToUTF8(ExeDir());
+    while (running.load()) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+        timeval tv{1, 0};
+        if (select(0, &fds, nullptr, nullptr, &tv) <= 0) continue;
+        sockaddr_in client{};
+        int client_len = sizeof(client);
+        const auto cs = accept(sock, reinterpret_cast<SOCKADDR*>(&client), &client_len);
+        if (cs == INVALID_SOCKET) continue;
+        char req[4096];
+        int r = recv(cs, req, sizeof(req) - 1, 0);
+        if (r > 0) {
+            req[r] = '\0';
+            char method[16] = {}, path[1024] = {};
+            if (sscanf_s(req, "%15s %1023s", method, (unsigned)sizeof(method), path, (unsigned)sizeof(path)) >= 2) {
+                char* q = strchr(path, '?');
+                if (q) *q = '\0';
+                if (strcmp(path, "/") == 0) {
+                    std::string html = "<html><head><meta charset='utf-8'><title>Shared KM</title></head><body>"
+                        "<h2>Shared KM Builds</h2><ul>";
+                    WIN32_FIND_DATAA ffd;
+                    std::string sp = file_dir + "shared_km_*.exe";
+                    HANDLE hf = FindFirstFileA(sp.c_str(), &ffd);
+                    if (hf != INVALID_HANDLE_VALUE) {
+                        do html += "<li><a href=\"/" + std::string(ffd.cFileName) + "\">" + ffd.cFileName + "</a></li>";
+                        while (FindNextFileA(hf, &ffd));
+                        FindClose(hf);
+                    }
+                    sp = file_dir + "shared_km.exe";
+                    hf = FindFirstFileA(sp.c_str(), &ffd);
+                    if (hf != INVALID_HANDLE_VALUE) { html += "<li><a href=\"/shared_km.exe\">shared_km.exe</a></li>"; FindClose(hf); }
+                    html += "</ul></body></html>";
+                    char resp[4096];
+                    auto len = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", html.size(), html.c_str());
+                    send(cs, resp, static_cast<int>(len), 0);
+                } else {
+                    std::string req_path = path + 1;
+                    if (req_path.find("..") != std::string::npos) {
+                        const char* rp = "HTTP/1.1 403\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden";
+                        send(cs, rp, static_cast<int>(strlen(rp)), 0);
+                    } else {
+                        std::string fp = file_dir + req_path;
+                        FILE* f = fopen(fp.c_str(), "rb");
+                        if (f) {
+                            fseek(f, 0, SEEK_END);
+                            long fs = ftell(f);
+                            fseek(f, 0, SEEK_SET);
+                            char hdr[512];
+                            auto hl = snprintf(hdr, sizeof(hdr),
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %ld\r\nContent-Disposition: attachment\r\nConnection: close\r\n\r\n", fs);
+                            send(cs, hdr, static_cast<int>(hl), 0);
+                            std::vector<char> cb(65536);
+                            size_t nr;
+                            while ((nr = fread(cb.data(), 1, cb.size(), f)) > 0) send(cs, cb.data(), static_cast<int>(nr), 0);
+                            fclose(f);
+                        } else {
+                            const char* rp = "HTTP/1.1 404\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+                            send(cs, rp, static_cast<int>(strlen(rp)), 0);
+                        }
+                    }
+                }
+            }
+        }
+        closesocket(cs);
+    }
+    closesocket(sock);
 }
 
 std::wstring SenderConfigPath() {
@@ -711,6 +802,7 @@ void StartSender() {
     auto cfg = GetServiceConfig();
     g_sender_thread = std::thread(SenderConnectThreadFunc, cfg, std::ref(g_sender_active));
     SetThreadPriority(g_sender_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
+
 }
 
 void StopSender() {
@@ -1178,6 +1270,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         KillTimer(hwnd, kIdTimerStatus);
         Shell_NotifyIconW(NIM_DELETE, &g_notify);
         StopAllServices();
+        g_http_server_running.store(false);
+        if (g_http_server_thread.joinable()) g_http_server_thread.join();
         PostQuitMessage(0);
         break;
 
@@ -1288,6 +1382,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
     DragAcceptFiles(g_main_wnd, TRUE);
     ShowWindow(g_main_wnd, nCmdShow);
     UpdateWindow(g_main_wnd);
+
+    // Start HTTP download server (port 8888)
+    g_http_server_running.store(true);
+    g_http_server_thread = std::thread(RunHttpServer, std::ref(g_http_server_running));
+    SetThreadPriority(g_http_server_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
