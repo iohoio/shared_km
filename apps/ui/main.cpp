@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "shared_km/network/discovery.hpp"
+#include "shared_km/network/file_transfer.hpp"
 #include "shared_km/network/socket_runtime.hpp"
 #include "shared_km/network/tcp_server.hpp"
 #include "shared_km/network/tcp_client.hpp"
@@ -26,6 +27,7 @@
 #include "shared_km/service/receiver_app.hpp"
 #include "shared_km/service/sender_app.hpp"
 #include <atomic>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -38,6 +40,7 @@ namespace {
 // -- Window identifiers --
 constexpr UINT_PTR kIdTrayIcon = 1;
 constexpr UINT_PTR kIdTimerStatus = 2;
+constexpr UINT kMsgFileTransferDone = WM_APP + 2;
 
 enum CtrlId {
     kEditHost = 100,
@@ -53,6 +56,7 @@ enum CtrlId {
     kBtnDiscover,
     kStaticStatus,
     kListDevices,
+    kListFileTransfers,
 };
 
 // -- Global state --
@@ -75,6 +79,26 @@ std::wstring g_config_port = L"8765";
 std::wstring g_config_token = L"demo-token";
 // false = copy mode, true = extend mode
 bool g_config_extend_mode = false;
+
+// -- File transfer history --
+struct FileTransferEntry {
+    std::wstring filename;
+    std::wstring size_str;
+    bool success;
+};
+std::vector<FileTransferEntry> g_file_transfer_history;
+std::mutex g_file_transfer_mutex;
+HWND g_list_file_transfers = nullptr;
+shared_km::network::TcpFileServer g_file_server;
+std::thread g_file_server_thread;
+
+// Forward declarations
+void OnFileTransferComplete(const shared_km::network::FileTransferResult& result);
+void RefreshFileTransferList();
+
+// Current receiver address (updated when sender connects)
+std::string g_current_receiver_host;
+int g_current_receiver_port = 0;
 
 // -- In-process service state --
 std::atomic<bool> g_receiver_active{false};
@@ -109,6 +133,23 @@ std::wstring ExeDir() {
     auto pos = path.find_last_of(L"\\");
     if (pos != std::wstring::npos) path.resize(pos + 1);
     return path;
+}
+
+std::wstring FormatFileSize(std::uint64_t bytes) {
+    const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB"};
+    double size = static_cast<double>(bytes);
+    int unit = 0;
+    while (size >= 1024.0 && unit < 3) {
+        size /= 1024.0;
+        unit++;
+    }
+    wchar_t buf[32];
+    if (unit == 0) {
+        std::swprintf(buf, 32, L"%llu %s", bytes, units[unit]);
+    } else {
+        std::swprintf(buf, 32, L"%.1f %s", size, units[unit]);
+    }
+    return buf;
 }
 
 std::wstring SenderConfigPath() {
@@ -312,12 +353,24 @@ void StartReceiver() {
     auto cfg = GetServiceConfig();
     cfg.host = "0.0.0.0";  // listen on all interfaces so remote senders can connect
     g_receiver_thread = std::thread(ReceiverThreadFunc, cfg, std::ref(g_receiver_active));
+    SetThreadPriority(g_receiver_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
+
+    // Start file server for drag-and-drop file transfers (port+1)
+    auto save_dir = WStringToUTF8(ExeDir()) + "received_files\\";
+    auto file_port = static_cast<std::uint16_t>(cfg.port + 1);
+    if (g_file_server.Start("0.0.0.0", file_port, save_dir, OnFileTransferComplete))
+    {
+        g_file_server_thread = std::thread([&]() { g_file_server.RunAcceptLoop(); });
+        SetThreadPriority(g_file_server_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
+    }
 }
 
 void StopReceiver() {
     g_receiver_active = false;
     g_receiver_server.Close();
     if (g_receiver_thread.joinable()) g_receiver_thread.join();
+    g_file_server.Stop();
+    if (g_file_server_thread.joinable()) g_file_server_thread.join();
     SetWindowTextW(g_receiver_status, L"stopped");
 }
 
@@ -406,6 +459,9 @@ void SenderConnectThreadFunc(ServiceConfig cfg, std::atomic<bool>& running) {
             SetWindowTextW(g_sender_status, buf);
         }
         if (g_sender_client.Connect(target_host, static_cast<std::uint16_t>(target_port))) {
+            // Store receiver address for file transfers
+            g_current_receiver_host = target_host;
+            g_current_receiver_port = target_port;
             SetWindowTextW(g_sender_status, L"authenticating...");
             const auto hello = shared_km::protocol::SerializeHelloPayload({.device_name = "shared-km-sender"});
             const auto auth = shared_km::protocol::SerializeAuthPayload({.token = cfg.token});
@@ -654,6 +710,7 @@ void StartSender() {
     g_sender_active = true;
     auto cfg = GetServiceConfig();
     g_sender_thread = std::thread(SenderConnectThreadFunc, cfg, std::ref(g_sender_active));
+    SetThreadPriority(g_sender_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
 }
 
 void StopSender() {
@@ -699,6 +756,33 @@ void UpdateToggleButton(int id) {
     std::swprintf(text, 48, running ? L"● %s" : L"○ %s", name);
     SetWindowTextW(btn, text);
     SendMessageW(btn, BM_SETCHECK, running ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+void OnFileTransferComplete(const shared_km::network::FileTransferResult& result) {
+    FileTransferEntry entry;
+    entry.filename = UTF8ToWString(result.filename);
+    entry.size_str = FormatFileSize(result.size);
+    entry.success = result.success;
+    {
+        std::lock_guard<std::mutex> lock(g_file_transfer_mutex);
+        g_file_transfer_history.push_back(std::move(entry));
+    }
+    PostMessageW(g_main_wnd, kMsgFileTransferDone, 0, 0);
+}
+
+void RefreshFileTransferList() {
+    if (!g_list_file_transfers) return;
+    std::lock_guard<std::mutex> lock(g_file_transfer_mutex);
+    SendMessageW(g_list_file_transfers, LB_RESETCONTENT, 0, 0);
+    for (const auto& entry : g_file_transfer_history) {
+        wchar_t line[512];
+        std::swprintf(line, 512, L"%s (%s) %s",
+                       entry.filename.c_str(),
+                       entry.size_str.c_str(),
+                       entry.success ? L"✓ done" : L"✗ failed");
+        SendMessageW(g_list_file_transfers, LB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(line));
+    }
 }
 
 void ShowTrayNotification(const std::wstring& title, const std::wstring& msg) {
@@ -848,6 +932,20 @@ void CreateControls(HWND hwnd) {
                     margin + (util_w + 6) * 2, ctrl_y, util_w, ctrl_h,
                     hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBtnDiscover)),
                     g_instance, nullptr);
+
+    // -- File transfer history --
+    const int ft_h = 100;
+    int ft_y = ctrl_y + ctrl_h + margin;
+    CreateWindowExW(0, L"BUTTON", L"File Transfers (drag files onto this window)",
+                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                    margin, ft_y, group_w, ft_h,
+                    hwnd, nullptr, g_instance, nullptr);
+    g_list_file_transfers = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                             WS_CHILD | WS_VISIBLE | LBS_NOINTEGRALHEIGHT |
+                                             WS_VSCROLL | WS_HSCROLL,
+                                             margin + 8, ft_y + 16, group_w - 16, ft_h - 24,
+                                             hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListFileTransfers)),
+                                             g_instance, nullptr);
 }
 
 // -- Config loading --
@@ -949,6 +1047,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             break;
         }
         }
+        return 0;
+    }
+
+    if (msg == kMsgFileTransferDone) {
+        RefreshFileTransferList();
         return 0;
     }
 
@@ -1076,6 +1179,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         PostQuitMessage(0);
         break;
 
+    case WM_DROPFILES: {
+        HDROP hDrop = reinterpret_cast<HDROP>(wparam);
+        const int count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+        // Need receiver address from sender connection
+        std::string file_host = g_current_receiver_host;
+        int file_port_val = g_current_receiver_port;
+        if (file_host.empty() || file_port_val == 0) {
+            ShowTrayNotification(L"File Transfer", L"No active receiver connection");
+            DragFinish(hDrop);
+            break;
+        }
+        for (int i = 0; i < count; i++) {
+            wchar_t path[MAX_PATH];
+            DragQueryFileW(hDrop, i, path, MAX_PATH);
+            auto utf8_path = WStringToUTF8(path);
+            auto file_port = static_cast<std::uint16_t>(file_port_val + 1);
+            std::thread([utf8_path, file_host, file_port]() {
+                shared_km::network::SendFileOverTcp(file_host, file_port, utf8_path,
+                                                     OnFileTransferComplete);
+            }).detach();
+        }
+        DragFinish(hDrop);
+        break;
+    }
+
     default:
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
@@ -1138,7 +1266,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
 
     if (!RegisterClassExW(&wc)) return 1;
 
-    int w = 400, h = 560;
+    int w = 400, h = 680;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
@@ -1148,6 +1276,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
     if (!g_main_wnd) return 1;
 
     SetupTrayIcon(g_main_wnd);
+    DragAcceptFiles(g_main_wnd, TRUE);
     ShowWindow(g_main_wnd, nCmdShow);
     UpdateWindow(g_main_wnd);
 

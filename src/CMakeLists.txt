@@ -34,6 +34,7 @@ add_library(shared_km_network
     network/tcp_client.cpp
     network/tcp_server.cpp
     network/discovery.cpp
+    network/file_transfer.cpp
 )
 
 target_include_directories(shared_km_network
