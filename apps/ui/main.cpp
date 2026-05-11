@@ -776,10 +776,10 @@ void RefreshFileTransferList() {
     SendMessageW(g_list_file_transfers, LB_RESETCONTENT, 0, 0);
     for (const auto& entry : g_file_transfer_history) {
         wchar_t line[512];
-        std::swprintf(line, 512, L"%s (%s) %s",
+        std::swprintf(line, 512, L"%s (%s) %s → received_files\\",
                        entry.filename.c_str(),
                        entry.size_str.c_str(),
-                       entry.success ? L"✓ done" : L"✗ failed");
+                       entry.success ? L"[OK]" : L"[FAIL]");
         SendMessageW(g_list_file_transfers, LB_ADDSTRING, 0,
                      reinterpret_cast<LPARAM>(line));
     }

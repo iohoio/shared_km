@@ -16,9 +16,9 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
     exit 1
 fi
 
-# Copy with versioned name
-cp build-fresh/apps/Release/shared_km.exe "shared_km/shared_km_${VER}.exe"
-echo "=== Deployed: shared_km_${VER}.exe ==="
+# Rename with versioned name
+mv build-fresh/apps/Release/shared_km.exe "build-fresh/apps/Release/shared_km_${VER}.exe"
+echo "=== Built: build-fresh/apps/Release/shared_km_${VER}.exe ==="
 
 # Increment version
 echo $((BUILD_NUM + 1)) > version.txt
