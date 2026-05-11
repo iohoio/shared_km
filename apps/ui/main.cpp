@@ -802,7 +802,13 @@ bool SetupTrayIcon(HWND hwnd) {
     g_notify.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_notify.uCallbackMessage = WM_APP + 1;
     g_notify.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcsncpy_s(g_notify.szTip, L"Shared KM Controller", _TRUNCATE);
+    int ver_num = 0;
+    FILE* vf = _wfopen((ExeDir() + L"version.txt").c_str(), L"r");
+    if (!vf) vf = fopen("version.txt", "r");
+    if (vf) { fscanf(vf, "%d", &ver_num); fclose(vf); }
+    wchar_t tip[128];
+    std::swprintf(tip, 128, L"Shared KM Controller v0.%02d", ver_num);
+    wcsncpy_s(g_notify.szTip, tip, _TRUNCATE);
     return Shell_NotifyIconW(NIM_ADD, &g_notify) != FALSE;
 }
 
@@ -1274,6 +1280,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                                   x, y, w, h, nullptr, nullptr, hInstance, nullptr);
     if (!g_main_wnd) return 1;
+
+    // Read version.txt and update title
+    {
+        int ver_num = 0;
+        FILE* vf = _wfopen((ExeDir() + L"version.txt").c_str(), L"r");
+        if (!vf) vf = fopen("version.txt", "r");
+        if (vf) { fscanf(vf, "%d", &ver_num); fclose(vf); }
+        wchar_t title[128];
+        std::swprintf(title, 128, L"Shared KM Controller v0.%02d", ver_num);
+        SetWindowTextW(g_main_wnd, title);
+    }
 
     SetupTrayIcon(g_main_wnd);
     DragAcceptFiles(g_main_wnd, TRUE);
